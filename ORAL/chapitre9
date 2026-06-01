@@ -1,0 +1,463 @@
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import TwoSlopeNorm
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1.  CONSTANTES PHYSIQUES
+# ═══════════════════════════════════════════════════════════════════════════════
+c    = 3e8               # vitesse de la lumière          [m/s]
+eps0 = 8.854187817e-12   # permittivité du vide            [F/m]
+mu0  = 4e-7 * np.pi      # perméabilité du vide            [H/m]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2.  PARAMÈTRES DE SIMULATION
+# ═══════════════════════════════════════════════════════════════════════════════
+f0     = 10e9        # fréquence de la source             [Hz]
+lam0   = c / f0      # longueur d'onde λ₀                 [m]  = 3 cm
+
+# Pas de discrétisation — éq. (13) : Δx = λ/20
+dx = lam0 / 20       # = 1.5 mm
+dy = dx              # grille carrée
+
+# Pas temporel — éq. (14) : Δt = Δx / (2c)
+dt = dx / (2 * c)    # = 2.5 ps
+
+# Domaine
+Nx          = 280    # cellules selon x  (axe du guide, direction de propagation)
+N_inner     = 20     # cellules intérieures du guide (sans les deux parois PEC)
+Ny          = N_inner + 2  # total avec parois : 22
+
+# Largeur physique du guide
+b = N_inner * dy     # b = 20 × 1.5 mm = 30 mm
+
+# Fréquences de coupure — f_cn = n·c / (2b),  n = 1, 2, …
+fc1 = c / (2 * b)    # 1re fréquence de coupure
+fc2 = 2 * fc1        # 2e  fréquence de coupure
+
+# Amplitude de la source (densité de courant)
+Jz0 = 1.0 / (dt / eps0)   # → incrément Ez ~ 1 V/m par itération
+
+# Position de la source (colonne)
+src_i = 30
+
+# Nombre d'itérations
+Q_total = 3000
+
+# ── Affichage des paramètres ──────────────────────────────────────────────────
+print("=" * 54)
+print("   Simulation FDTD 2D — Guide entre deux plaques PEC")
+print("=" * 54)
+print(f"  f₀        = {f0/1e9:.1f} GHz")
+print(f"  λ₀        = {lam0*1e3:.1f} mm")
+print(f"  Δx = Δy   = {dx*1e3:.2f} mm  (= λ₀/20)  [éq. 13]")
+print(f"  Δt        = {dt*1e12:.2f} ps  (= Δx/2c)  [éq. 14]")
+print(f"  Grille    = {Nx} × {Ny}  (guide : {N_inner} cellules internes)")
+print(f"  b         = {b*1e3:.1f} mm")
+print(f"  f_c1      = {fc1/1e9:.3f} GHz")
+print(f"  f_c2      = {fc2/1e9:.3f} GHz")
+print(f"  f₀/f_c1   = {f0/fc1:.3f}  →  Guide PASSANT ✓" if f0 > fc1
+      else f"  f₀/f_c1   = {f0/fc1:.3f}  →  Guide BLOQUÉ  ✗")
+print("=" * 54)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3.  NOYAU FDTD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fdtd_guide(f_source, Q=Q_total, record_snapshots=False):
+    """
+    Effectue Q itérations de l'algorithme de Yee 2D dans le guide.
+
+    Variables : Ez, B̃x = c·Bx, B̃y = c·By   (notation du projet éq. 15)
+
+    Paramètres
+    ----------
+    f_source         : float — fréquence de la source [Hz]
+    Q                : int   — nombre d'itérations
+    record_snapshots : bool  — si True, enregistre des instantanés Ez
+
+    Retours
+    -------
+    Ez_final  : ndarray(Nx, Ny) — Ez à l'instant final
+    Ez_amp    : ndarray(Nx, Ny) — amplitude RMS de Ez
+    snapshots : list            — instantanés (si record_snapshots=True)
+    """
+
+    # ── Conditions initiales nulles ───────────────────────────────────────────
+    Ez   = np.zeros((Nx, Ny))    # Ez[i,   j]        grille entière
+    Bx_t = np.zeros((Nx, Ny))    # B̃x[i, j+1/2]   → stocké à l'indice j
+    By_t = np.zeros((Nx, Ny))    # B̃y[i+1/2, j]   → stocké à l'indice i
+
+    # ── Amplitude RMS (moyenne exponentielle pondérée de Ez²) ────────────────
+    Ez_amp = np.zeros((Nx, Ny))
+    alpha_rms = 0.994            # coefficient de lissage
+
+    # ── Profil transverse de la source : sin(πy/b) ───────────────────────────
+    # Nul sur les parois (j=0 et j=Ny-1), maximum en j = Ny/2
+    j_inner = np.arange(1, Ny - 1)                     # indices intérieurs
+    src_profile = np.sin(np.pi * j_inner / (Ny - 1))   # sin(πy/b)
+
+    omega = 2 * np.pi * f_source
+    snapshots = []
+
+    # ── Boucle temporelle ─────────────────────────────────────────────────────
+    for q in range(Q):
+        t = q * dt   # temps courant [s]
+
+        # ── Sous-itération 1 : mise à jour de B̃x et B̃y  (à l'instant q+1/2)
+        # éq. (16) généralisée 2D  →  B̃x[i, j+1/2]
+        #   B̃x^{q+1/2} = B̃x^{q-1/2}  -  1/2 · (Ez[i,j+1] − Ez[i,j])
+        Bx_t[:, :-1] -= 0.5 * (Ez[:, 1:] - Ez[:, :-1])
+
+        # éq. (16) généralisée 2D  →  B̃y[i+1/2, j]
+        #   B̃y^{q+1/2} = B̃y^{q-1/2}  +  1/2 · (Ez[i+1,j] − Ez[i,j])
+        By_t[:-1, :] += 0.5 * (Ez[1:, :] - Ez[:-1, :])
+
+        # ── Sous-itération 2 : mise à jour de Ez  (à l'instant q+1)
+        # éq. (16) généralisée 2D  (partie intérieure, hors parois et bords)
+        #   Ez^{q+1} = Ez^q
+        #            + 1/2 · (B̃y[i,j]   − B̃y[i-1,j])
+        #            − 1/2 · (B̃x[i,j]   − B̃x[i,j-1])
+        #            − (Δt/ε₀) · Jz^{q+1/2}
+        Ez[1:-1, 1:-1] += (
+              0.5 * (By_t[1:-1, 1:-1] - By_t[:-2,  1:-1])
+            - 0.5 * (Bx_t[1:-1, 1:-1] - Bx_t[1:-1, :-2])
+        )
+
+        # ── Injection de source — densité de courant sinusoïdale  Jz ─────────
+        # Enveloppe progressive sur 3 périodes (évite les transitoires)
+        env = min(1.0, t * f_source / 3.0)
+        # Jz évalué à (q+1/2)·Δt (centrage temporel du schéma de Yee)
+        Jz_t = Jz0 * np.sin(omega * (t + 0.5 * dt)) * env
+        # Terme source : −(Δt/ε₀) · Jz  (éq. 16 du projet)
+        Ez[src_i, 1:-1] -= (dt / eps0) * Jz_t * src_profile
+
+        # ── Conditions limites (§2.3 du projet) ─────────────────────────────
+        # Parois PEC : Ez = 0 sur y = 0 et y = b  (condition aux limites PEC)
+        Ez[:, 0]  = 0.0
+        Ez[:, -1] = 0.0
+        # Bords du domaine : Ez = 0 (conditions nulles pour 2D, éq. projet §2.3)
+        Ez[0, :]  = 0.0
+        Ez[-1, :] = 0.0
+
+        # ── Mise à jour de l'amplitude RMS ───────────────────────────────────
+        Ez_amp = alpha_rms * Ez_amp + (1 - alpha_rms) * Ez**2
+
+        # ── Enregistrement des instantanés ────────────────────────────────────
+        if record_snapshots and (q % (Q // 4) == 0) and q > 0:
+            snapshots.append((q, Ez.copy()))
+
+    return Ez.copy(), np.sqrt(Ez_amp), snapshots
+
+
+def fdtd_anim_frames(f_source, Q=2000, snap_start=1200, snap_every=6):
+    """Comme fdtd_guide mais collecte des frames Ez pour animation."""
+    Ez   = np.zeros((Nx, Ny))
+    Bx_t = np.zeros((Nx, Ny))
+    By_t = np.zeros((Nx, Ny))
+    j_inner = np.arange(1, Ny - 1)
+    src_profile = np.sin(np.pi * j_inner / (Ny - 1))
+    omega = 2 * np.pi * f_source
+    frames = []
+    for q in range(Q):
+        t = q * dt
+        Bx_t[:, :-1] -= 0.5 * (Ez[:, 1:] - Ez[:, :-1])
+        By_t[:-1, :] += 0.5 * (Ez[1:, :] - Ez[:-1, :])
+        Ez[1:-1, 1:-1] += (
+              0.5 * (By_t[1:-1, 1:-1] - By_t[:-2,  1:-1])
+            - 0.5 * (Bx_t[1:-1, 1:-1] - Bx_t[1:-1, :-2])
+        )
+        env = min(1.0, t * f_source / 3.0)
+        Jz_t = Jz0 * np.sin(omega * (t + 0.5 * dt)) * env
+        Ez[src_i, 1:-1] -= (dt / eps0) * Jz_t * src_profile
+        Ez[:, 0] = Ez[:, -1] = Ez[0, :] = Ez[-1, :] = 0.0
+        if q >= snap_start and q % snap_every == 0:
+            frames.append(Ez.copy())
+    return frames
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4.  SIMULATIONS : GUIDE BLOQUÉ et GUIDE PASSANT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Les deux cas correspondent à f₀ < f_c1 (bloqué) et f_c1 < f₀ < f_c2 (passant)
+# On change la fréquence source tout en gardant la même grille.
+f_bloque  = 0.60 * fc1   # en-dessous de la coupure → TE₁ évanescent
+f_passant = 0.65 * fc2   # entre f_c1 et f_c2       → TE₁ seul se propage
+
+cas = {
+    "bloqué":  f_bloque,
+    "passant": f_passant,
+}
+
+resultats = {}
+for nom, freq in cas.items():
+    print(f"\n→ Simulation : guide {nom}  (f = {freq/1e9:.3f} GHz, "
+          f"f/f_c1 = {freq/fc1:.3f})")
+    Ez_fin, Ez_amp, _ = fdtd_guide(freq, Q=Q_total)
+    resultats[nom] = {"Ez": Ez_fin, "amp": Ez_amp, "f": freq}
+    print(f"   terminée.  |Ez|_max = {np.abs(Ez_fin).max():.3f} V/m")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5.  VISUALISATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Axes physiques en mm
+x_mm = np.arange(Nx) * dx * 1e3          # [mm]
+y_mm = np.arange(Ny) * dy * 1e3          # [mm]
+X, Y = np.meshgrid(x_mm, y_mm, indexing='ij')
+
+fig = plt.figure(figsize=(14, 10))
+fig.patch.set_facecolor('#0d1117')
+
+gs = gridspec.GridSpec(
+    3, 2,
+    figure=fig,
+    hspace=0.55, wspace=0.35,
+    top=0.93, bottom=0.06, left=0.08, right=0.97
+)
+
+# Colormap divergente pour Ez (bleu–blanc–rouge)
+from matplotlib.colors import LinearSegmentedColormap
+cmap_ez = LinearSegmentedColormap.from_list(
+    'ez', ['#0a3dff', '#10102a', '#ff1a1a'])
+
+# Colormap amplitude (feu)
+cmap_amp = LinearSegmentedColormap.from_list(
+    'amp', ['#08090f', '#4a0030', '#cc2800', '#ff8c00', '#ffff80'])
+
+ax_title = fig.add_subplot(gs[0, :])
+ax_title.axis('off')
+
+titres_col = ["Guide BLOQUÉ  (f < f_c1)", "Guide PASSANT  (f_c1 < f < f_c2)"]
+titres_row = ["E_z instantané", "Amplitude RMS de E_z"]
+
+axes = [[fig.add_subplot(gs[row + 1, col])
+         for col in range(2)]
+        for row in range(2)]
+
+for col, (nom, data) in enumerate(resultats.items()):
+    f_sim = data["f"]
+    ratio = f_sim / fc1
+
+    for row, (champ, cmap, label_cb) in enumerate([
+        (data["Ez"],  cmap_ez,  "E_z  [V/m]"),
+        (data["amp"], cmap_amp, "|E_z| RMS  [V/m]"),
+    ]):
+        ax = axes[row][col]
+        ax.set_facecolor('#08090f')
+
+        if row == 0:
+            # Normalisation symétrique pour Ez
+            vmax = np.abs(champ).max() * 0.95 or 1.0
+            norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+            im = ax.pcolormesh(X, Y, champ, cmap=cmap_ez,
+                               norm=norm, shading='auto', rasterized=True)
+        else:
+            vmax = champ.max() * 0.95 or 1.0
+            im = ax.pcolormesh(X, Y, champ, cmap=cmap_amp,
+                               vmin=0, vmax=vmax,
+                               shading='auto', rasterized=True)
+
+        # Parois PEC (traits gris)
+        for yp in [y_mm[0], y_mm[-1]]:
+            ax.axhline(yp, color='#c0c8d0', linewidth=2.0)
+
+        # Position de la source
+        ax.axvline(x_mm[src_i], color='#ffff50', linewidth=0.8,
+                   linestyle='--', alpha=0.6, label='source')
+
+        # Colourbar
+        cb = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.04)
+        cb.ax.tick_params(labelsize=7, colors='#8b9bb4')
+        cb.set_label(label_cb, fontsize=7, color='#8b9bb4')
+
+        # Décoration axes
+        ax.set_xlabel("x  [mm]", fontsize=8, color='#8b9bb4')
+        ax.set_ylabel("y  [mm]", fontsize=8, color='#8b9bb4')
+        ax.tick_params(colors='#8b9bb4', labelsize=7)
+        for spine in ax.spines.values():
+            spine.set_edgecolor('#2a3040')
+
+        # Titre de la sous-figure
+        titre_mode = f"{titres_row[row]}\n"
+        titre_mode += f"f = {f_sim/1e9:.3f} GHz,  f/f_c1 = {ratio:.2f}"
+        if row == 0:
+            titre_mode = f"{titres_col[col]}\n" + titre_mode
+        ax.set_title(titre_mode, fontsize=8, color='#c9d1d9',
+                     pad=5, loc='left')
+
+# Titre global
+fc1_str = f"f_c1 = {fc1/1e9:.3f} GHz"
+fc2_str = f"f_c2 = {fc2/1e9:.3f} GHz"
+b_str   = f"b = {b*1e3:.1f} mm"
+fig.suptitle(
+    f"FDTD 2D — Guide entre deux plaques PEC\n"
+    f"Éqs. (15)–(16) du Projet FDTD 2026 · B̃ = c·B · "
+    f"{b_str} · {fc1_str} · {fc2_str}",
+    fontsize=10, color='#cba6f7', y=0.98
+)
+
+plt.show()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6.  FIGURE COMPLÉMENTAIRE : PROFILS TRANSVERSES + VÉRIFICATION THÉORIQUE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+fig2, axes2 = plt.subplots(1, 2, figsize=(12, 4.5))
+fig2.patch.set_facecolor('#0d1117')
+
+for ax in axes2:
+    ax.set_facecolor('#0d1117')
+
+for col, (nom, data) in enumerate(resultats.items()):
+    ax = axes2[col]
+    amp = data["amp"]
+    f_sim = data["f"]
+
+    # Profil transverse de l'amplitude en x = milieu du guide
+    # (mesure à plusieurs positions pour illustrer la propagation/décroissance)
+    x_positions = {
+        "x proche source":  src_i + 5,
+        "x milieu":         src_i + (Nx - src_i) // 3,
+        "x loin source":    src_i + 2 * (Nx - src_i) // 3,
+    }
+
+    y_mm_inner = y_mm[1:-1]   # axe y sans les parois
+
+    colors_lines = ['#58a6ff', '#3fb950', '#f85149']
+    for (label, xi), col_l in zip(x_positions.items(), colors_lines):
+        if 0 <= xi < Nx:
+            profil = amp[xi, 1:-1]
+            ax.plot(profil / (profil.max() + 1e-20), y_mm_inner,
+                    color=col_l, linewidth=1.5, label=label)
+
+    # Profil théorique TE₁ : sin(πy/b)
+    y_th = np.linspace(y_mm[1], y_mm[-2], 200)
+    profil_th = np.sin(np.pi * (y_th - y_mm[1]) / (b * 1e3))
+    ax.plot(profil_th, y_th, 'w--', linewidth=1.0, alpha=0.5,
+            label="sin(πy/b)  théorique")
+
+    # Lignes parois PEC
+    ax.axhline(y_mm[0],  color='#9eaabb', linewidth=2)
+    ax.axhline(y_mm[-1], color='#9eaabb', linewidth=2)
+
+    ax.set_xlabel("Amplitude normalisée", fontsize=9, color='#8b9bb4')
+    ax.set_ylabel("y  [mm]", fontsize=9, color='#8b9bb4')
+    ax.tick_params(colors='#8b9bb4', labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#2a3040')
+
+    ratio_str = f"f/f_c1 = {f_sim/fc1:.2f}"
+    statut = "PASSANT ✓" if f_sim > fc1 else "BLOQUÉ ✗"
+    ax.set_title(
+        f"Guide {nom}  —  {statut}\n"
+        f"f = {f_sim/1e9:.3f} GHz,  {ratio_str}",
+        fontsize=9, color='#c9d1d9', pad=6
+    )
+    leg = ax.legend(fontsize=7.5, facecolor='#1a1f2e',
+                    labelcolor='#c9d1d9', framealpha=0.8)
+    leg.get_frame().set_edgecolor('#2a3040')
+
+fig2.suptitle(
+    "Profils transverses de |E_z| RMS — comparaison simulation FDTD vs. théorie",
+    fontsize=10, color='#cba6f7', y=1.01
+)
+fig2.tight_layout()
+plt.show()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7.  RÉSUMÉ NUMÉRIQUE
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 54)
+print("   Résumé")
+print("=" * 54)
+print(f"  λ₀  = {lam0*1e3:.1f} mm   Δx = {dx*1e3:.2f} mm   Δt = {dt*1e12:.2f} ps")
+print(f"  b   = {b*1e3:.1f} mm   f_c1 = {fc1/1e9:.3f} GHz  f_c2 = {fc2/1e9:.3f} GHz")
+print()
+for nom, data in resultats.items():
+    f_sim = data["f"]
+    alpha_ev = np.sqrt(max(0, (np.pi / b)**2 - (2*np.pi*f_sim/c)**2))
+    print(f"  Guide {nom:8s}  f = {f_sim/1e9:.3f} GHz  "
+          f"f/f_c1 = {f_sim/fc1:.3f}", end="")
+    if f_sim < fc1:
+        print(f"  →  α = {alpha_ev:.2f} m⁻¹  "
+              f"(décroissance sur {1/alpha_ev*1e3:.1f} mm)")
+    else:
+        beta_g = np.sqrt((2*np.pi*f_sim/c)**2 - (np.pi/b)**2)
+        lam_g  = 2*np.pi / beta_g
+        vg     = c * np.sqrt(1 - (fc1/f_sim)**2)
+        print(f"  →  λ_g = {lam_g*1e3:.1f} mm  v_g = {vg/c:.3f}·c")
+print("=" * 54)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8.  ANIMATION
+# ═══════════════════════════════════════════════════════════════════════════════
+from matplotlib.animation import FuncAnimation
+
+_snap_start = 1200
+_snap_every = 12   # 1 frame tous les 12 pas → ~67 frames au total
+
+print("\n→ Calcul des frames pour l'animation…")
+frames_b = fdtd_anim_frames(f_bloque,  snap_start=_snap_start, snap_every=_snap_every)
+frames_p = fdtd_anim_frames(f_passant, snap_start=_snap_start, snap_every=_snap_every)
+n_frames = min(len(frames_b), len(frames_p))
+print(f"   {n_frames} frames par cas.")
+
+vmax_b = max(np.abs(f).max() for f in frames_b) * 0.95 or 1.0
+vmax_p = max(np.abs(f).max() for f in frames_p) * 0.95 or 1.0
+
+fig_a, axes_a = plt.subplots(1, 2, figsize=(12, 3.0))
+fig_a.patch.set_facecolor('#0d1117')
+for ax in axes_a:
+    ax.set_facecolor('#08090f')
+
+norm_b = TwoSlopeNorm(vmin=-vmax_b, vcenter=0, vmax=vmax_b)
+norm_p = TwoSlopeNorm(vmin=-vmax_p, vcenter=0, vmax=vmax_p)
+
+im_b = axes_a[0].pcolormesh(X, Y, frames_b[0], cmap=cmap_ez, norm=norm_b,
+                              shading='auto', rasterized=True)
+im_p = axes_a[1].pcolormesh(X, Y, frames_p[0], cmap=cmap_ez, norm=norm_p,
+                              shading='auto', rasterized=True)
+
+for ax, nom, freq, im in zip(
+        axes_a, ["BLOQUÉ", "PASSANT"], [f_bloque, f_passant], [im_b, im_p]):
+    for yp in [y_mm[0], y_mm[-1]]:
+        ax.axhline(yp, color='#c0c8d0', linewidth=2.0)
+    ax.axvline(x_mm[src_i], color='#ffff50', linewidth=0.8,
+               linestyle='--', alpha=0.6)
+    ax.set_xlabel("x  [mm]", fontsize=8, color='#8b9bb4')
+    ax.set_ylabel("y  [mm]", fontsize=8, color='#8b9bb4')
+    ax.tick_params(colors='#8b9bb4', labelsize=7)
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#2a3040')
+    ax.set_title(
+        f"Guide {nom}  —  f = {freq/1e9:.3f} GHz  (f/f_c1 = {freq/fc1:.2f})",
+        fontsize=8, color='#c9d1d9')
+    cb = fig_a.colorbar(im, ax=ax, pad=0.02, fraction=0.04)
+    cb.ax.tick_params(labelsize=7, colors='#8b9bb4')
+    cb.set_label("E_z  [V/m]", fontsize=7, color='#8b9bb4')
+
+time_text = fig_a.text(0.5, 0.99, '', ha='center',
+                        color='#cba6f7', fontsize=9, transform=fig_a.transFigure)
+fig_a.suptitle("Animation FDTD 2D — champ E_z(x, y, t)",
+               fontsize=10, color='#cba6f7', y=1.06)
+fig_a.tight_layout()
+
+def update(frame):
+    im_b.set_array(frames_b[frame])
+    im_p.set_array(frames_p[frame])
+    t_ps = (_snap_start + frame * _snap_every) * dt * 1e12
+    time_text.set_text(f"t = {t_ps:.0f} ps")
+    return im_b, im_p, time_text
+
+anim = FuncAnimation(fig_a, update, frames=n_frames, interval=60, blit=True)
+plt.show()
